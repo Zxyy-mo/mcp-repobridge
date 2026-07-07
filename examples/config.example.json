@@ -1,0 +1,64 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "transport": "stdio",
+    "authTokenEnv": "SECURE_MCP_TOKEN",
+    "allowedOrigins": [
+      "https://chatgpt.com",
+      "https://chat.openai.com"
+    ]
+  },
+  "workspace": {
+    "root": "/absolute/path/to/project",
+    "containerPath": "/workspace",
+    "defaultMountMode": "ro",
+    "maxReadBytes": 1048576,
+    "maxDirectoryEntries": 1000
+  },
+  "sandbox": {
+    "containerName": "secure-mcp-sandbox",
+    "image": "secure-mcp-sandbox:latest",
+    "network": "none",
+    "memory": "2g",
+    "cpus": "2",
+    "pidsLimit": 256,
+    "user": "1000:1000",
+    "readOnlyRootfs": true,
+    "tmpfs": [
+      "/tmp:rw,nosuid,nodev,size=512m"
+    ],
+    "timeoutMs": 30000,
+    "maxOutputBytes": 200000
+  },
+  "policy": {
+    "allowExec": true,
+    "execMode": "denylist",
+    "denyNetworkCommands": true,
+    "denyDockerInsideContainer": true,
+    "denySecretsRead": true
+  },
+  "audit": {
+    "enabled": true,
+    "path": ".secure-mcp/audit.log"
+  },
+  "codexHandoff": {
+    "enabled": false,
+    "queuePath": ".secure-mcp/codex-tasks",
+    "maxPromptBytes": 24000,
+    "maxResultBytes": 200000,
+    "maxTasksListed": 50,
+    "taskTimeoutMs": 1800000,
+    "workerPollIntervalMs": 5000,
+    "codexCommand": "codex",
+    "codexArgs": [
+      "exec",
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "never",
+      "--json",
+      "-"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "mcp-repobridge",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/index.js --config=examples/config.example.json",
+    "bridge": "node scripts/secure_bridge.mjs",
+    "codex-worker": "node dist/cli/codexWorker.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "zod": "latest",
+    "fast-glob": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}
