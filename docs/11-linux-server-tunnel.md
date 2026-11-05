@@ -226,7 +226,8 @@ Before testing from ChatGPT:
 - Do not mount host HOME, SSH keys, cloud credentials, browser profiles, or
   Docker socket into the sandbox.
 - Keep sandbox network as `none` unless you have a reviewed reason to change it.
-- Keep workspace mount `ro` for review-style use.
+- Keep using the filtered disposable sandbox workspace; never replace it with a
+  direct host-workspace mount.
 - Stop the tunnel when testing is done.
 - Rotate the token if the URL or token was shared in the wrong place.
 

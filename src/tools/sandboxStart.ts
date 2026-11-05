@@ -14,7 +14,8 @@ export async function sandboxStartTool(config: RuntimeConfig) {
         containerName: config.sandbox.containerName,
         image: config.sandbox.image,
         network: config.sandbox.network,
-        mountMode: config.workspace.defaultMountMode
+        workspaceMode: "filtered-ephemeral-copy",
+        snapshot: result.snapshot
       },
       durationMs: Date.now() - started,
       exitCode: result.code,

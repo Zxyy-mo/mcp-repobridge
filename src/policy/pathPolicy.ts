@@ -51,14 +51,23 @@ export function assertNotSecretLike(workspaceRoot: string, absolutePath: string)
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new PolicyError(`Path escapes workspace: ${absolutePath}`);
   }
-  const parts = relative.split(path.sep);
+  const normalized = relative.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
   if (parts.some((part) => SECRET_PATH_PARTS.has(part))) {
     throw new PolicyError(`Secret-like path is blocked: ${relative}`);
   }
-  const basename = path.basename(absolutePath);
+  const basename = parts.at(-1) ?? "";
   if (SECRET_FILE_PATTERNS.some((pattern) => pattern.test(basename))) {
     throw new PolicyError(`Secret-like file is blocked: ${relative}`);
   }
+}
+
+export function isSecretLikeRelativePath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.some((part) => SECRET_PATH_PARTS.has(part))) return true;
+  const basename = parts.at(-1) ?? "";
+  return SECRET_FILE_PATTERNS.some((pattern) => pattern.test(basename));
 }
 
 function isSubpath(root: string, candidate: string): boolean {

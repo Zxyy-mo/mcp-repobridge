@@ -5,6 +5,7 @@ RUN apt-get update \
     bash \
     git \
     ripgrep \
+    util-linux \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 

@@ -1,18 +1,27 @@
 import path from "node:path/posix";
 import type { RuntimeConfig } from "../config/config.js";
 import { validateCommand } from "../policy/commandPolicy.js";
-import { spawnLimited } from "../utils/childProcess.js";
+import { PolicyError } from "../policy/errors.js";
 import { writeAudit } from "../audit/auditLog.js";
+import { inspectSandboxState, startSandbox } from "../sandbox/dockerClient.js";
+import { runSandboxCommand } from "../sandbox/taskRunner.js";
 
 export async function execContainerTool(
   config: RuntimeConfig,
-  input: { command: string; workdir?: string; timeoutMs?: number }
+  input: {
+    command: string;
+    workdir?: string;
+    timeoutMs?: number;
+    yieldMs?: number;
+    projectTask?: { name: string; kind: string; source: string };
+  }
 ) {
   if (!config.policy.allowExec) {
-    throw new Error("exec_container is disabled by policy");
+    throw new PolicyError("exec_container is disabled by policy");
   }
 
   const started = Date.now();
+  let autoStarted = false;
   try {
     validateCommand(input.command, {
       mode: config.policy.execMode,
@@ -24,30 +33,40 @@ export async function execContainerTool(
     }
     const timeoutMs = Math.min(input.timeoutMs ?? config.sandbox.timeoutMs, config.sandbox.timeoutMs);
 
-    const result = await spawnLimited("docker", [
-      "exec",
-      "-i",
-      "--workdir",
-      safeWorkdir,
-      config.sandbox.containerName,
-      "bash",
-      "-lc",
-      input.command
-    ], {
+    const state = await inspectSandboxState(config);
+    if (state.exists && !state.managed) {
+      throw new Error(`Refusing to execute in unmanaged container: ${config.sandbox.containerName}`);
+    }
+    if (config.sandbox.startMode === "on-demand") {
+      if (!state.running) {
+        const sandboxStart = await startSandbox(config);
+        if (sandboxStart.code !== 0) {
+          throw new Error(sandboxStart.stderr || sandboxStart.stdout || "Failed to start Docker sandbox");
+        }
+        autoStarted = true;
+      }
+    }
+
+    const result = await runSandboxCommand(config, {
+      command: input.command,
+      workdir: safeWorkdir,
       timeoutMs,
-      maxOutputBytes: config.sandbox.maxOutputBytes,
-      env: { PATH: process.env.PATH ?? "" }
+      yieldMs: input.yieldMs,
+      projectTask: input.projectTask
     });
+    const exitCode = "code" in result ? result.code : undefined;
+    const stdout = "stdout" in result ? result.stdout : "";
+    const stderr = "stderr" in result ? result.stderr : "";
 
     await writeAudit(config, {
       timestamp: new Date().toISOString(),
       tool: "exec_container",
       action: "allow",
-      summary: { commandPreview: input.command.slice(0, 120), workdir: safeWorkdir },
+      summary: { commandPreview: input.command.slice(0, 120), workdir: safeWorkdir, autoStarted },
       durationMs: Date.now() - started,
-      exitCode: result.code,
-      stdoutBytes: Buffer.byteLength(result.stdout),
-      stderrBytes: Buffer.byteLength(result.stderr)
+      exitCode,
+      stdoutBytes: Buffer.byteLength(stdout),
+      stderrBytes: Buffer.byteLength(stderr)
     });
 
     return result;

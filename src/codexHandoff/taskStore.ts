@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { RuntimeConfig } from "../config/config.js";
 import { PolicyError } from "../policy/errors.js";
 import { assertNotSecretLike, resolveWorkspacePath } from "../policy/pathPolicy.js";
+import { captureGitWorkspaceState, sha256File } from "../utils/workspaceRevision.js";
 
 export const CODEX_TASK_STATUSES = ["queued", "running", "succeeded", "failed", "canceled"] as const;
 export type CodexTaskStatus = typeof CODEX_TASK_STATUSES[number];
@@ -22,6 +24,13 @@ export type CodexTask = {
   updatedAt: string;
   createdBy: "mcp";
   attempts: number;
+  idempotencyKey?: string;
+  baseline: {
+    capturedAt: string;
+    gitHead?: string;
+    workspaceChanges: string[];
+    relevantFiles: Array<{ path: string; sha256: string; size: number; mtimeMs: number }>;
+  };
   worker?: {
     workerId: string;
     pid?: number;
@@ -35,9 +44,14 @@ export type CodexTask = {
     signal: NodeJS.Signals | null;
     timedOut: boolean;
     truncated: boolean;
+    canceled: boolean;
     stdoutTail: string;
     stderrTail: string;
     logPath: string;
+    changedFiles: string[];
+    preexistingChanges: string[];
+    diffStat?: string;
+    contextDrift?: Array<{ path: string; expectedSha256: string; actualSha256?: string; reason: string }>;
   };
   cancellation?: {
     requestedAt: string;
@@ -56,18 +70,47 @@ export type CreateCodexTaskInput = {
   acceptanceCriteria?: string[];
   relevantFiles?: string[];
   priority?: CodexTaskPriority;
+  idempotencyKey?: string;
 };
 
 export type CodexTaskQueuePaths = {
   queueRoot: string;
   tasksDir: string;
   logsDir: string;
+  heartbeatsDir: string;
+  idempotencyDir: string;
 };
 
 const TASK_ID_PATTERN = /^task_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}$/;
 const TERMINAL_STATUSES = new Set<CodexTaskStatus>(["succeeded", "failed", "canceled"]);
+const idempotencyLocks = new Map<string, Promise<void>>();
 
-export async function createCodexTask(config: RuntimeConfig, input: CreateCodexTaskInput): Promise<CodexTask> {
+export async function createCodexTask(
+  config: RuntimeConfig,
+  input: CreateCodexTaskInput
+): Promise<{ task: CodexTask; reused: boolean }> {
+  if (!input.idempotencyKey) return createCodexTaskUnlocked(config, input);
+  const lockKey = `${config.workspace.root}\0${input.idempotencyKey.trim()}`;
+  const previous = idempotencyLocks.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => gate);
+  idempotencyLocks.set(lockKey, tail);
+  await previous;
+  try {
+    return await createCodexTaskUnlocked(config, input);
+  } finally {
+    release();
+    if (idempotencyLocks.get(lockKey) === tail) idempotencyLocks.delete(lockKey);
+  }
+}
+
+async function createCodexTaskUnlocked(
+  config: RuntimeConfig,
+  input: CreateCodexTaskInput
+): Promise<{ task: CodexTask; reused: boolean }> {
   ensureHandoffEnabled(config);
   const title = input.title.trim();
   const prompt = input.prompt.trim();
@@ -85,6 +128,28 @@ export async function createCodexTask(config: RuntimeConfig, input: CreateCodexT
     .filter(Boolean)
     .slice(0, 20);
   const relevantFiles = await normalizeRelevantFiles(config, input.relevantFiles ?? []);
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+  const requestDigest = createHash("sha256").update(JSON.stringify({
+    title,
+    prompt,
+    acceptanceCriteria,
+    relevantFiles,
+    priority: input.priority ?? "normal"
+  })).digest("hex");
+  if (idempotencyKey) {
+    const existing = await readIdempotencyRecord(config, idempotencyKey);
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) {
+        throw new PolicyError("Codex task idempotency key conflicts with different request content");
+      }
+      return { task: await readCodexTask(config, existing.taskId), reused: true };
+    }
+  }
+  const git = await captureGitWorkspaceState(config.workspace.root);
+  const relevantFileSnapshots = await Promise.all(relevantFiles.map(async (file) => ({
+    path: file,
+    ...await sha256File(path.join(config.workspace.root, file), config.workspace.maxHashBytes)
+  })));
   const now = new Date().toISOString();
   const task: CodexTask = {
     schemaVersion: 1,
@@ -98,10 +163,20 @@ export async function createCodexTask(config: RuntimeConfig, input: CreateCodexT
     createdAt: now,
     updatedAt: now,
     createdBy: "mcp",
-    attempts: 0
+    attempts: 0,
+    idempotencyKey,
+    baseline: {
+      capturedAt: now,
+      gitHead: git?.head,
+      workspaceChanges: git?.changes ?? [],
+      relevantFiles: relevantFileSnapshots
+    }
   };
   await writeTask(config, task);
-  return task;
+  if (idempotencyKey) {
+    await writeIdempotencyRecord(config, idempotencyKey, { taskId: task.id, requestDigest });
+  }
+  return { task, reused: false };
 }
 
 export async function listCodexTasks(
@@ -138,21 +213,18 @@ export async function readCodexTask(config: RuntimeConfig, taskId: string): Prom
 export async function cancelCodexTask(config: RuntimeConfig, taskId: string, reason?: string): Promise<CodexTask> {
   const task = await readCodexTask(config, taskId);
   if (TERMINAL_STATUSES.has(task.status)) return task;
-  if (task.status === "running") {
-    throw new PolicyError("Running Codex tasks cannot be canceled through MCP; stop the local worker instead");
-  }
   const now = new Date().toISOString();
-  const canceled: CodexTask = {
+  const updated: CodexTask = {
     ...task,
-    status: "canceled",
+    status: task.status === "running" ? "running" : "canceled",
     updatedAt: now,
     cancellation: {
       requestedAt: now,
       reason: reason?.trim() || undefined
     }
   };
-  await writeTask(config, canceled);
-  return canceled;
+  await writeTask(config, updated);
+  return updated;
 }
 
 export async function claimNextCodexTask(
@@ -186,7 +258,7 @@ export async function claimNextCodexTask(
 export async function finishCodexTask(
   config: RuntimeConfig,
   taskId: string,
-  status: Extract<CodexTaskStatus, "succeeded" | "failed">,
+  status: Extract<CodexTaskStatus, "succeeded" | "failed" | "canceled">,
   result: CodexTask["result"]
 ): Promise<CodexTask> {
   if (!result) throw new Error("Codex task result is required");
@@ -214,30 +286,52 @@ export async function writeCodexTaskLog(config: RuntimeConfig, taskId: string, c
 export async function tailCodexTaskLog(
   config: RuntimeConfig,
   taskId: string,
-  bytes?: number
-): Promise<{ taskId: string; content: string; bytesRead: number; truncated: boolean }> {
+  input: { offset?: number; bytes?: number } = {}
+): Promise<{
+  taskId: string;
+  content: string;
+  offset: number;
+  nextOffset: number;
+  totalBytes: number;
+  bytesRead: number;
+  truncated: boolean;
+}> {
   assertValidTaskId(taskId);
   const { logsDir } = await ensureQueuePaths(config);
   const logPath = path.join(logsDir, `${taskId}.log`);
-  const maxBytes = Math.min(bytes ?? config.codexHandoff.maxResultBytes, config.codexHandoff.maxResultBytes);
+  const maxBytes = Math.min(input.bytes ?? config.codexHandoff.maxResultBytes, config.codexHandoff.maxResultBytes);
   let data: Buffer;
+  if (input.offset !== undefined && input.offset < 0) throw new PolicyError("Codex task log offset must be non-negative");
   try {
-    const stat = await fs.lstat(logPath);
-    if (!stat.isFile()) throw new PolicyError("Codex task log is not a regular file");
-    data = await fs.readFile(logPath);
+    const handle = await fs.open(logPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new PolicyError("Codex task log is not a regular file");
+      const start = input.offset === undefined
+        ? Math.max(0, stat.size - maxBytes)
+        : Math.min(input.offset, stat.size);
+      const bytesToRead = Math.min(maxBytes, stat.size - start);
+      data = Buffer.alloc(bytesToRead);
+      const { bytesRead } = await handle.read(data, 0, data.length, start);
+      const end = start + bytesRead;
+      return {
+        taskId,
+        content: data.subarray(0, bytesRead).toString("utf8"),
+        offset: start,
+        nextOffset: end,
+        totalBytes: stat.size,
+        bytesRead,
+        truncated: end < stat.size
+      };
+    } finally {
+      await handle.close();
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { taskId, content: "", bytesRead: 0, truncated: false };
+      return { taskId, content: "", offset: 0, nextOffset: 0, totalBytes: 0, bytesRead: 0, truncated: false };
     }
     throw error;
   }
-  const start = Math.max(0, data.length - maxBytes);
-  return {
-    taskId,
-    content: data.subarray(start).toString("utf8"),
-    bytesRead: data.length - start,
-    truncated: start > 0
-  };
 }
 
 export function taskToView(task: CodexTask, options: { includePrompt?: boolean } = {}): CodexTaskView {
@@ -269,9 +363,56 @@ async function normalizeRelevantFiles(config: RuntimeConfig, requestedFiles: str
   for (const requestedFile of requestedFiles.slice(0, 50)) {
     const resolved = await resolveWorkspacePath(config.workspace.root, requestedFile);
     assertNotSecretLike(config.workspace.root, resolved);
+    const stat = await fs.stat(resolved);
+    if (!stat.isFile()) {
+      throw new PolicyError(`Codex relevant file must be a regular file: ${requestedFile}`);
+    }
+    if (stat.size > config.workspace.maxHashBytes) {
+      throw new PolicyError(
+        `Codex relevant file exceeds the ${config.workspace.maxHashBytes} byte snapshot limit: ${requestedFile}`
+      );
+    }
     normalized.add(path.relative(config.workspace.root, resolved).replace(/\\/g, "/"));
   }
   return [...normalized].sort();
+}
+
+function normalizeIdempotencyKey(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim();
+  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(normalized)) {
+    throw new PolicyError("Codex task idempotency key must use 1-200 safe ASCII characters");
+  }
+  return normalized;
+}
+
+async function readIdempotencyRecord(
+  config: RuntimeConfig,
+  key: string
+): Promise<{ taskId: string; requestDigest: string } | undefined> {
+  const { idempotencyDir } = await ensureQueuePaths(config);
+  try {
+    return JSON.parse(await readRegularFile(path.join(idempotencyDir, `${idempotencyFileId(key)}.json`)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function writeIdempotencyRecord(
+  config: RuntimeConfig,
+  key: string,
+  record: { taskId: string; requestDigest: string }
+): Promise<void> {
+  const { idempotencyDir } = await ensureQueuePaths(config);
+  const destination = path.join(idempotencyDir, `${idempotencyFileId(key)}.json`);
+  const temporary = path.join(idempotencyDir, `.${idempotencyFileId(key)}.${process.pid}.${Date.now()}.tmp`);
+  await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  await fs.rename(temporary, destination);
+}
+
+function idempotencyFileId(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 32);
 }
 
 async function taskPath(config: RuntimeConfig, taskId: string): Promise<string> {
@@ -288,9 +429,7 @@ async function writeTask(config: RuntimeConfig, task: CodexTask): Promise<void> 
 }
 
 async function readTaskFile(filePath: string): Promise<CodexTask> {
-  const stat = await fs.lstat(filePath);
-  if (!stat.isFile()) throw new PolicyError("Codex task record is not a regular file");
-  const task = JSON.parse(await fs.readFile(filePath, "utf8")) as CodexTask;
+  const task = JSON.parse(await readRegularFile(filePath)) as CodexTask;
   assertValidTaskId(task.id);
   if (!CODEX_TASK_STATUSES.includes(task.status)) {
     throw new PolicyError(`Invalid Codex task status: ${task.status}`);
@@ -298,22 +437,43 @@ async function readTaskFile(filePath: string): Promise<CodexTask> {
   return task;
 }
 
-async function ensureQueuePaths(config: RuntimeConfig): Promise<CodexTaskQueuePaths> {
+export async function ensureQueuePaths(config: RuntimeConfig): Promise<CodexTaskQueuePaths> {
   const workspaceRoot = await fs.realpath(config.workspace.root);
   const queueRoot = path.resolve(workspaceRoot, config.codexHandoff.queuePath);
   assertInsideWorkspace(workspaceRoot, queueRoot, "Codex queue path escapes workspace");
   await assertExistingAncestorInside(workspaceRoot, queueRoot);
   const tasksDir = path.join(queueRoot, "tasks");
   const logsDir = path.join(queueRoot, "logs");
-  await fs.mkdir(tasksDir, { recursive: true });
-  await fs.mkdir(logsDir, { recursive: true });
+  const heartbeatsDir = path.join(queueRoot, "worker-heartbeats");
+  const idempotencyDir = path.join(queueRoot, "idempotency");
+  await fs.mkdir(tasksDir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(logsDir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(heartbeatsDir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(idempotencyDir, { recursive: true, mode: 0o700 });
   const realQueueRoot = await fs.realpath(queueRoot);
   assertInsideWorkspace(workspaceRoot, realQueueRoot, "Codex queue realpath escapes workspace");
   const realTasksDir = await fs.realpath(tasksDir);
   const realLogsDir = await fs.realpath(logsDir);
+  const realHeartbeatsDir = await fs.realpath(heartbeatsDir);
+  const realIdempotencyDir = await fs.realpath(idempotencyDir);
   assertInsideWorkspace(workspaceRoot, realTasksDir, "Codex task directory realpath escapes workspace");
   assertInsideWorkspace(workspaceRoot, realLogsDir, "Codex log directory realpath escapes workspace");
-  return { queueRoot, tasksDir, logsDir };
+  assertInsideWorkspace(workspaceRoot, realHeartbeatsDir, "Codex heartbeat directory realpath escapes workspace");
+  assertInsideWorkspace(workspaceRoot, realIdempotencyDir, "Codex idempotency directory realpath escapes workspace");
+  await Promise.all([realQueueRoot, realTasksDir, realLogsDir, realHeartbeatsDir, realIdempotencyDir]
+    .map((candidate) => fs.chmod(candidate, 0o700)));
+  return { queueRoot, tasksDir, logsDir, heartbeatsDir, idempotencyDir };
+}
+
+async function readRegularFile(filePath: string): Promise<string> {
+  const handle = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new PolicyError("Codex state file is not a regular file");
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 function assertInsideWorkspace(workspaceRoot: string, candidate: string, message: string): void {

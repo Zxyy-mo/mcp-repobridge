@@ -4,9 +4,13 @@ import { writeAudit } from "../audit/auditLog.js";
 import {
   claimNextCodexTask,
   finishCodexTask,
+  readCodexTask,
   writeCodexTaskLog,
   type CodexTask
 } from "./taskStore.js";
+import { writeWorkerHeartbeat } from "./workerHeartbeat.js";
+import { captureGitWorkspaceState, sha256File } from "../utils/workspaceRevision.js";
+import path from "node:path";
 
 type ProcessNextOptions = {
   workerId?: string;
@@ -15,7 +19,7 @@ type ProcessNextOptions = {
 type ProcessNextResult = {
   processed: boolean;
   taskId?: string;
-  status?: "succeeded" | "failed";
+  status?: "succeeded" | "failed" | "canceled";
 };
 
 type SpawnWithInputResult = {
@@ -25,18 +29,40 @@ type SpawnWithInputResult = {
   stderr: string;
   timedOut: boolean;
   truncated: boolean;
+  canceled: boolean;
 };
+
+const SENSITIVE_ENV_NAME_PATTERN = /(?:SECRET|TOKEN|KEY|CREDENTIAL|PASSWORD|AUTH)/i;
 
 export async function processNextCodexTask(
   config: RuntimeConfig,
   options: ProcessNextOptions = {}
 ): Promise<ProcessNextResult> {
   const workerId = options.workerId ?? `codex-worker-${process.pid}`;
+  await writeWorkerHeartbeat(config, { workerId, pid: process.pid, status: "idle" });
   const task = await claimNextCodexTask(config, { workerId, pid: process.pid });
   if (!task) return { processed: false };
 
-  const result = await runCodexTask(config, task);
-  const status = result.exitCode === 0 && !result.timedOut ? "succeeded" : "failed";
+  await writeWorkerHeartbeat(config, { workerId, pid: process.pid, status: "running", taskId: task.id });
+  const heartbeatTimer = setInterval(() => {
+    void writeWorkerHeartbeat(config, {
+      workerId,
+      pid: process.pid,
+      status: "running",
+      taskId: task.id
+    }).catch(() => undefined);
+  }, config.codexHandoff.workerHeartbeatIntervalMs);
+  heartbeatTimer.unref();
+  let result: NonNullable<CodexTask["result"]>;
+  try {
+    const contextDrift = await detectContextDrift(config, task);
+    result = contextDrift.length > 0 && config.codexHandoff.failOnContextDrift
+      ? await contextDriftResult(config, task, contextDrift)
+      : await runCodexTask(config, task);
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+  const status = result.canceled ? "canceled" : result.exitCode === 0 && !result.timedOut ? "succeeded" : "failed";
   await finishCodexTask(config, task.id, status, result);
   await writeAudit(config, {
     timestamp: new Date().toISOString(),
@@ -47,12 +73,15 @@ export async function processNextCodexTask(
       title: task.title,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
-      truncated: result.truncated
+      truncated: result.truncated,
+      canceled: result.canceled,
+      changedFiles: result.changedFiles
     },
     exitCode: result.exitCode,
     stdoutBytes: Buffer.byteLength(result.stdoutTail, "utf8"),
     stderrBytes: Buffer.byteLength(result.stderrTail, "utf8")
   });
+  await writeWorkerHeartbeat(config, { workerId, pid: process.pid, status: "idle" });
   return { processed: true, taskId: task.id, status };
 }
 
@@ -97,7 +126,15 @@ async function runCodexTask(config: RuntimeConfig, task: CodexTask): Promise<Non
       {
         cwd: config.workspace.root,
         timeoutMs: config.codexHandoff.taskTimeoutMs,
-        maxOutputBytes: config.codexHandoff.maxResultBytes
+        maxOutputBytes: config.codexHandoff.maxResultBytes,
+        env: buildCodexWorkerEnv(
+          process.env,
+          config.codexHandoff.allowedEnvKeys,
+          config.codexHandoff.allowedEnvPrefixes
+        ),
+        cancellationPollIntervalMs: config.codexHandoff.cancellationPollIntervalMs,
+        cancellationGraceMs: config.codexHandoff.cancellationGraceMs,
+        shouldCancel: async () => Boolean((await readTaskCancellation(config, task.id)))
       }
     );
   } catch (error) {
@@ -107,11 +144,15 @@ async function runCodexTask(config: RuntimeConfig, task: CodexTask): Promise<Non
       stdout: "",
       stderr: error instanceof Error ? error.message : String(error),
       timedOut: false,
-      truncated: false
+      truncated: false,
+      canceled: false
     };
   }
 
   const finishedAt = new Date().toISOString();
+  const git = await captureGitWorkspaceState(config.workspace.root);
+  const preexistingChanges = task.baseline?.workspaceChanges ?? [];
+  const changedFiles = git?.changes ?? [];
   const logPath = await writeCodexTaskLog(config, task.id, [
     `Task: ${task.id}`,
     `Title: ${task.title}`,
@@ -122,6 +163,9 @@ async function runCodexTask(config: RuntimeConfig, task: CodexTask): Promise<Non
     `Signal: ${result.signal ?? ""}`,
     `Timed out: ${result.timedOut}`,
     `Truncated: ${result.truncated}`,
+    `Canceled: ${result.canceled}`,
+    `Changed files: ${changedFiles.join(", ") || "none detected"}`,
+    git?.diffStat ? `Diff stat:\n${git.diffStat}` : "Diff stat: none",
     "",
     "STDOUT:",
     result.stdout,
@@ -136,9 +180,13 @@ async function runCodexTask(config: RuntimeConfig, task: CodexTask): Promise<Non
     signal: result.signal,
     timedOut: result.timedOut,
     truncated: result.truncated,
+    canceled: result.canceled,
     stdoutTail: tailText(result.stdout, config.codexHandoff.maxResultBytes),
     stderrTail: tailText(result.stderr, config.codexHandoff.maxResultBytes),
-    logPath
+    logPath,
+    changedFiles,
+    preexistingChanges,
+    diffStat: git?.diffStat
   };
 }
 
@@ -146,13 +194,22 @@ async function spawnWithInput(
   command: string,
   args: string[],
   input: string,
-  options: { cwd: string; timeoutMs: number; maxOutputBytes: number }
+  options: {
+    cwd: string;
+    timeoutMs: number;
+    maxOutputBytes: number;
+    env: NodeJS.ProcessEnv;
+    cancellationPollIntervalMs: number;
+    cancellationGraceMs: number;
+    shouldCancel: () => Promise<boolean>;
+  }
 ): Promise<SpawnWithInputResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
       shell: false,
-      env: process.env
+      env: options.env,
+      detached: process.platform !== "win32"
     });
 
     let stdout = Buffer.alloc(0);
@@ -160,12 +217,33 @@ async function spawnWithInput(
     let truncated = false;
     let timeoutFired = false;
     let killedForOutputLimit = false;
+    let canceled = false;
     let settled = false;
+    let cancellationKillTimer: NodeJS.Timeout | undefined;
 
     const timer = setTimeout(() => {
       timeoutFired = true;
-      child.kill("SIGKILL");
+      terminateChild(child, "SIGKILL");
     }, options.timeoutMs);
+
+    let cancellationCheckRunning = false;
+    const cancellationTimer = setInterval(() => {
+      if (cancellationCheckRunning || canceled || settled) return;
+      cancellationCheckRunning = true;
+      void options.shouldCancel().then((requested) => {
+        if (requested && !settled) {
+          canceled = true;
+          terminateChild(child, "SIGTERM");
+          cancellationKillTimer = setTimeout(() => {
+            if (!settled) terminateChild(child, "SIGKILL");
+          }, options.cancellationGraceMs);
+          cancellationKillTimer.unref();
+        }
+      }).finally(() => {
+        cancellationCheckRunning = false;
+      });
+    }, options.cancellationPollIntervalMs);
+    cancellationTimer.unref();
 
     const append = (current: Buffer, chunk: Buffer) => {
       const next = Buffer.concat([current, chunk]);
@@ -173,7 +251,7 @@ async function spawnWithInput(
         truncated = true;
         if (!killedForOutputLimit) {
           killedForOutputLimit = true;
-          child.kill("SIGKILL");
+          terminateChild(child, "SIGKILL");
         }
         return next.subarray(next.length - options.maxOutputBytes);
       }
@@ -190,6 +268,8 @@ async function spawnWithInput(
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        clearInterval(cancellationTimer);
+        if (cancellationKillTimer) clearTimeout(cancellationKillTimer);
         reject(error);
       }
     });
@@ -197,23 +277,124 @@ async function spawnWithInput(
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        clearInterval(cancellationTimer);
+        if (cancellationKillTimer) clearTimeout(cancellationKillTimer);
         resolve({
           code,
           signal,
           stdout: stdout.toString("utf8"),
           stderr: stderr.toString("utf8"),
           timedOut: timeoutFired,
-          truncated
+          truncated,
+          canceled
         });
       }
     });
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE") {
-        child.kill("SIGKILL");
+        terminateChild(child, "SIGKILL");
       }
     });
     child.stdin.end(input);
   });
+}
+
+async function detectContextDrift(
+  config: RuntimeConfig,
+  task: CodexTask
+): Promise<NonNullable<NonNullable<CodexTask["result"]>["contextDrift"]>> {
+  const drift: NonNullable<NonNullable<CodexTask["result"]>["contextDrift"]> = [];
+  for (const expected of task.baseline?.relevantFiles ?? []) {
+    try {
+      const actual = await sha256File(
+        path.join(config.workspace.root, expected.path),
+        config.workspace.maxHashBytes
+      );
+      if (actual.sha256 !== expected.sha256) {
+        drift.push({
+          path: expected.path,
+          expectedSha256: expected.sha256,
+          actualSha256: actual.sha256,
+          reason: "content_changed"
+        });
+      }
+    } catch {
+      drift.push({
+        path: expected.path,
+        expectedSha256: expected.sha256,
+        reason: "missing_or_unreadable"
+      });
+    }
+  }
+  return drift;
+}
+
+async function contextDriftResult(
+  config: RuntimeConfig,
+  task: CodexTask,
+  contextDrift: NonNullable<NonNullable<CodexTask["result"]>["contextDrift"]>
+): Promise<NonNullable<CodexTask["result"]>> {
+  const finishedAt = new Date().toISOString();
+  const message = `Task stopped before Codex execution because ${contextDrift.length} relevant file(s) changed after queueing.`;
+  const logPath = await writeCodexTaskLog(config, task.id, [
+    `Task: ${task.id}`,
+    `Title: ${task.title}`,
+    `Finished: ${finishedAt}`,
+    "Outcome: context drift",
+    message,
+    JSON.stringify(contextDrift, null, 2)
+  ].join("\n"));
+  return {
+    finishedAt,
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    truncated: false,
+    canceled: false,
+    stdoutTail: "",
+    stderrTail: message,
+    logPath,
+    changedFiles: [],
+    preexistingChanges: task.baseline?.workspaceChanges ?? [],
+    contextDrift
+  };
+}
+
+async function readTaskCancellation(config: RuntimeConfig, taskId: string) {
+  try {
+    return (await readCodexTask(config, taskId)).cancellation;
+  } catch {
+    return undefined;
+  }
+}
+
+function terminateChild(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Fall back to the direct child when the process group no longer exists.
+    }
+  }
+  child.kill(signal);
+}
+
+export function buildCodexWorkerEnv(
+  source: NodeJS.ProcessEnv,
+  allowedKeys: string[],
+  allowedPrefixes: string[]
+): NodeJS.ProcessEnv {
+  const allowedKeySet = new Set(allowedKeys);
+  const result: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (SENSITIVE_ENV_NAME_PATTERN.test(key)) continue;
+    if (allowedKeySet.has(key) || allowedPrefixes.some((prefix) => key.startsWith(prefix))) {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 function tailText(value: string, maxBytes: number): string {

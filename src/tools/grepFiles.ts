@@ -5,6 +5,7 @@ import type { RuntimeConfig } from "../config/config.js";
 import { auditToolCall } from "../audit/auditLog.js";
 import { PolicyError } from "../policy/errors.js";
 import { assertNotSecretLike, resolveWorkspacePath } from "../policy/pathPolicy.js";
+import { decodeCursor, encodeCursor } from "../utils/cursor.js";
 
 const DEFAULT_EXCLUDES = [
   "**/.git/**",
@@ -25,14 +26,15 @@ export type GrepMatch = {
 
 export async function grepFilesTool(
   config: RuntimeConfig,
-  input: { pattern: string; path?: string; include?: string[]; exclude?: string[]; maxMatches?: number }
+  input: { pattern: string; path?: string; include?: string[]; exclude?: string[]; maxMatches?: number; cursor?: string }
 ) {
   return auditToolCall(config, "grep_files", {
     path: input.path ?? ".",
     pattern: input.pattern,
     include: input.include,
     exclude: input.exclude,
-    maxMatches: input.maxMatches
+    maxMatches: input.maxMatches,
+    continuing: Boolean(input.cursor)
   }, async () => {
     if (!input.pattern) {
       throw new PolicyError("grep_files pattern cannot be empty");
@@ -50,7 +52,7 @@ export async function grepFilesTool(
     const maxMatches = Math.min(input.maxMatches ?? 100, 1000);
     const include = normalizeGlobPatterns(input.include ?? (stat.isFile() ? [path.basename(searchRoot)] : ["**/*"]));
     const ignore = [...DEFAULT_EXCLUDES, ...normalizeGlobPatterns(input.exclude ?? [])];
-    const files = stat.isFile()
+    const files = (stat.isFile()
       ? [path.basename(searchRoot)]
       : await fg(include, {
         cwd: searchRoot,
@@ -58,11 +60,22 @@ export async function grepFilesTool(
         onlyFiles: true,
         unique: true,
         ignore
-      });
+      })).sort((left, right) => left.localeCompare(right));
+
+    const workspaceRelativeRoot = path.relative(config.workspace.root, searchRoot).replace(/\\/g, "/");
+    const scope = {
+      path: workspaceRelativeRoot,
+      pattern: input.pattern,
+      include: [...include].sort(),
+      exclude: [...ignore].sort()
+    };
+    const position = decodeCursor<{ file: string; line: number }>(input.cursor, "grep_files", scope);
 
     const matches: GrepMatch[] = [];
+    const positions: Array<{ file: string; line: number }> = [];
+    let hasMore = false;
+    outer:
     for (const file of files) {
-      if (matches.length >= maxMatches) break;
       const absolutePath = stat.isFile() ? searchRoot : path.join(searchRoot, file);
       const realPath = await resolveWorkspacePath(config.workspace.root, absolutePath);
       try {
@@ -79,23 +92,52 @@ export async function grepFilesTool(
       if (content.includes("\0")) continue;
       const lines = content.split(/\r?\n/);
       for (let index = 0; index < lines.length; index += 1) {
+        const line = index + 1;
+        if (position && (file.localeCompare(position.file) < 0 || (file === position.file && line <= position.line))) {
+          continue;
+        }
         const lineText = lines[index] ?? "";
+        regexp.lastIndex = 0;
         const found = regexp.exec(lineText);
         if (!found) continue;
+        if (matches.length >= maxMatches) {
+          hasMore = true;
+          break outer;
+        }
         matches.push({
           path: toWorkspaceRelative(config.workspace.root, realPath),
-          line: index + 1,
+          line,
           column: found.index + 1,
           text: lineText,
           fileTruncated: truncated
         });
-        if (matches.length >= maxMatches) break;
+        positions.push({ file, line });
       }
     }
 
+    const lastPosition = positions.at(-1);
+    const nextCursor = hasMore && lastPosition
+      ? encodeCursor("grep_files", scope, lastPosition)
+      : undefined;
+
     return {
       matches,
-      truncated: matches.length >= maxMatches
+      truncated: hasMore,
+      nextCursor,
+      nextAction: nextCursor
+        ? {
+          tool: "grep_files",
+          arguments: {
+            pattern: input.pattern,
+            path: input.path,
+            include: input.include,
+            exclude: input.exclude,
+            maxMatches,
+            cursor: nextCursor
+          },
+          reason: "Continue the same search after the last returned match."
+        }
+        : undefined
     };
   }, (result) => ({
     stdoutBytes: Buffer.byteLength(JSON.stringify(result.matches))

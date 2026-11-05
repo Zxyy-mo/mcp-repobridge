@@ -1,0 +1,38 @@
+{
+  "enabled": true,
+  "hostMcpEnabled": false,
+  "skillDirs": [
+    "/absolute/path/to/trusted/skills"
+  ],
+  "maxSkills": 100,
+  "maxSkillBytes": 131072,
+  "discoveryTtlMs": 300000,
+  "connectTimeoutMs": 10000,
+  "callTimeoutMs": 60000,
+  "maxResultBytes": 262144,
+  "maxToolsPerServer": 100,
+  "maxConcurrentMcpProcesses": 4,
+  "safeEnvKeys": [
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "TERM",
+    "TMPDIR"
+  ],
+  "mcpServers": [
+    {
+      "name": "trusted-local-server",
+      "description": "Replace this placeholder with an MCP server you have reviewed.",
+      "enabled": true,
+      "command": "/absolute/path/to/trusted-mcp-server",
+      "args": [],
+      "allowedTools": [
+        "tool_name_you_reviewed"
+      ],
+      "envFromHost": {
+        "UPSTREAM_TOKEN": "LOCAL_UPSTREAM_TOKEN"
+      }
+    }
+  ]
+}

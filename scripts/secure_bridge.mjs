@@ -55,7 +55,10 @@ async function start(options) {
 
   await fs.mkdir(stateDir, { recursive: true });
   const configPath = path.resolve(options.config ?? path.join(stateDir, "runtime.config.json"));
-  const config = runtimeConfig(projectRoot, port, tokenEnv, options);
+  const extensionConfig = options.extensionsConfig
+    ? await loadExtensionConfig(path.resolve(options.extensionsConfig))
+    : options.extensionConfigValue;
+  const config = runtimeConfig(projectRoot, port, tokenEnv, { ...options, extensionConfig });
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
 
   const outPath = path.join(stateDir, "runtime.out.log");
@@ -94,6 +97,8 @@ async function start(options) {
     localMcpUrl,
     publicMcpUrl,
     codexHandoffEnabled: config.codexHandoff.enabled,
+    extensionsEnabled: config.extensions.enabled,
+    hostMcpEnabled: config.extensions.hostMcpEnabled,
     codexWorkerCommand: config.codexHandoff.enabled
       ? `npm run --silent codex-worker -- --config ${configPath}`
       : undefined,
@@ -139,6 +144,8 @@ async function status(options) {
     localMcpUrl: state.localMcpUrl,
     publicMcpUrl: state.publicMcpUrl,
     codexHandoffEnabled: state.codexHandoffEnabled,
+    extensionsEnabled: state.extensionsEnabled,
+    hostMcpEnabled: state.hostMcpEnabled,
     codexWorkerCommand: state.codexWorkerCommand,
     projectRoot: state.projectRoot,
     startedAt: state.startedAt,
@@ -148,11 +155,15 @@ async function status(options) {
 
 async function rotate(options) {
   const state = await readState(options);
+  const existingRuntimeConfig = state?.configPath
+    ? await readJsonIfExists(state.configPath)
+    : undefined;
   if (state?.runtime?.pid && isProcessRunning(state.runtime.pid)) {
     await stop(options);
   }
   await start({
     ...options,
+    extensionConfigValue: options.extensionsConfig ? undefined : existingRuntimeConfig?.extensions,
     token: randomBytes(32).toString("base64url"),
     projectRoot: options.projectRoot ?? state?.projectRoot,
     port: options.port ?? portFromUrl(state?.localMcpUrl)
@@ -210,24 +221,51 @@ async function waitForCloudflareUrl(logPaths, timeoutMs) {
 }
 
 function runtimeConfig(projectRoot, port, tokenEnv, options) {
+  if (options.mountMode && options.mountMode !== "ro") {
+    throw new Error("--mount-mode rw is no longer supported; the sandbox always uses a filtered ephemeral workspace copy");
+  }
+  const extensionDefaults = {
+    enabled: options.extensions === "true" || options.enableExtensions === "true",
+    hostMcpEnabled: options.hostMcp === "true" || options.hostMcpEnabled === "true",
+    skillDirs: splitList(options.skillDirs) ?? [],
+    maxSkills: Number(options.maxSkills ?? 100),
+    maxSkillBytes: Number(options.maxSkillBytes ?? 131072),
+    discoveryTtlMs: Number(options.extensionDiscoveryTtlMs ?? 300000),
+    connectTimeoutMs: Number(options.mcpConnectTimeoutMs ?? 10000),
+    callTimeoutMs: Number(options.mcpCallTimeoutMs ?? 60000),
+    maxResultBytes: Number(options.extensionMaxResultBytes ?? 262144),
+    maxToolsPerServer: Number(options.maxToolsPerMcpServer ?? 100),
+    maxConcurrentMcpProcesses: Number(options.maxConcurrentMcpProcesses ?? 4),
+    safeEnvKeys: splitList(options.extensionSafeEnvKeys) ?? [
+      "PATH", "HOME", "USER", "USERNAME", "LANG", "LC_ALL", "TERM", "TMPDIR", "TEMP", "TMP"
+    ],
+    mcpServers: []
+  };
   return {
     server: {
       host: options.host ?? "127.0.0.1",
       port,
       transport: "streamable-http",
       authTokenEnv: tokenEnv,
-      allowedOrigins: splitList(options.allowedOrigins) ?? ["https://chatgpt.com", "https://chat.openai.com"]
+      allowedOrigins: splitList(options.allowedOrigins) ?? ["https://chatgpt.com", "https://chat.openai.com"],
+      allowedHosts: splitList(options.allowedHosts) ?? defaultAllowedHosts(options, options.host ?? "127.0.0.1"),
+      maxSessions: Number(options.maxSessions ?? 100),
+      sessionTtlMs: Number(options.sessionTtlMs ?? 1800000)
     },
     workspace: {
       root: projectRoot,
       containerPath: options.containerPath ?? "/workspace",
-      defaultMountMode: options.mountMode ?? "ro",
+      defaultMountMode: "ro",
       maxReadBytes: Number(options.maxReadBytes ?? 1048576),
+      maxHashBytes: Number(options.maxHashBytes ?? 16777216),
+      maxBatchReadBytes: Number(options.maxBatchReadBytes ?? 4194304),
+      maxBatchReadItems: Number(options.maxBatchReadItems ?? 20),
       maxDirectoryEntries: Number(options.maxDirectoryEntries ?? 1000)
     },
     sandbox: {
       containerName: options.containerName ?? "secure-mcp-sandbox",
       image: options.image ?? "secure-mcp-sandbox:latest",
+      startMode: options.sandboxStartMode ?? "on-demand",
       network: options.network ?? "none",
       memory: options.memory ?? "2g",
       cpus: options.cpus ?? "2",
@@ -236,7 +274,11 @@ function runtimeConfig(projectRoot, port, tokenEnv, options) {
       readOnlyRootfs: options.readOnlyRootfs !== "false",
       tmpfs: splitList(options.tmpfs) ?? ["/tmp:rw,nosuid,nodev,size=512m"],
       timeoutMs: Number(options.timeoutMs ?? 30000),
-      maxOutputBytes: Number(options.maxOutputBytes ?? 200000)
+      maxOutputBytes: Number(options.maxOutputBytes ?? 200000),
+      taskPath: options.sandboxTaskPath ?? ".secure-mcp/sandbox-tasks",
+      commandYieldMs: Number(options.commandYieldMs ?? 8000),
+      maxTaskLogBytes: Number(options.maxTaskLogBytes ?? 1048576),
+      taskCancelGraceMs: Number(options.taskCancelGraceMs ?? 2000)
     },
     policy: {
       allowExec: options.allowExec !== "false",
@@ -250,6 +292,10 @@ function runtimeConfig(projectRoot, port, tokenEnv, options) {
       enabled: options.auditEnabled !== "false",
       path: options.auditPath ?? ".secure-mcp/audit.log"
     },
+    extensions: {
+      ...extensionDefaults,
+      ...(options.extensionConfig ?? {})
+    },
     codexHandoff: {
       enabled: options.codexHandoff === "true" || options.enableCodexHandoff === "true",
       queuePath: options.codexQueuePath ?? ".secure-mcp/codex-tasks",
@@ -258,6 +304,11 @@ function runtimeConfig(projectRoot, port, tokenEnv, options) {
       maxTasksListed: Number(options.codexMaxTasksListed ?? 50),
       taskTimeoutMs: Number(options.codexTaskTimeoutMs ?? 1800000),
       workerPollIntervalMs: Number(options.codexWorkerPollIntervalMs ?? 5000),
+      workerHeartbeatIntervalMs: Number(options.codexWorkerHeartbeatIntervalMs ?? 5000),
+      workerHeartbeatTtlMs: Number(options.codexWorkerHeartbeatTtlMs ?? 15000),
+      cancellationPollIntervalMs: Number(options.codexCancellationPollIntervalMs ?? 1000),
+      cancellationGraceMs: Number(options.codexCancellationGraceMs ?? 2000),
+      failOnContextDrift: options.codexFailOnContextDrift !== "false",
       codexCommand: options.codexCommand ?? "codex",
       codexArgs: splitList(options.codexArgs) ?? [
         "exec",
@@ -267,9 +318,55 @@ function runtimeConfig(projectRoot, port, tokenEnv, options) {
         "never",
         "--json",
         "-"
-      ]
+      ],
+      allowedEnvKeys: splitList(options.codexAllowedEnvKeys) ?? [
+        "PATH",
+        "HOME",
+        "USER",
+        "USERNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SHELL",
+        "CODEX_HOME"
+      ],
+      allowedEnvPrefixes: splitList(options.codexAllowedEnvPrefixes) ?? ["CODEX_"]
     }
   };
+}
+
+async function loadExtensionConfig(configPath) {
+  const parsed = JSON.parse(await fs.readFile(configPath, "utf8"));
+  const value = parsed?.extensions ?? parsed;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("--extensions-config must contain a JSON object or an { extensions: ... } object");
+  }
+  return value;
+}
+
+function defaultAllowedHosts(options, host) {
+  const hosts = new Set(["127.0.0.1", "localhost", "*.trycloudflare.com"]);
+  const normalizedHost = normalizeHostName(host);
+  if (normalizedHost && normalizedHost !== "0.0.0.0" && normalizedHost !== "::") {
+    hosts.add(normalizedHost);
+  }
+  if (options.publicBaseUrl) {
+    hosts.add(new URL(options.publicBaseUrl).hostname.toLowerCase());
+  }
+  return [...hosts];
+}
+
+function normalizeHostName(value) {
+  if (!value) return "";
+  const text = String(value).trim().toLowerCase();
+  if (text.startsWith("[")) {
+    const end = text.indexOf("]");
+    return end >= 0 ? text.slice(1, end) : text;
+  }
+  return text.replace(/:\d+$/, "");
 }
 
 async function requireState(options) {
@@ -425,6 +522,11 @@ Tunnel options:
 Codex handoff:
   --codex-handoff true
   npm run --silent codex-worker -- --config <project>/.secure-mcp/runtime.config.json
+
+Extension gateway:
+  --extensions true --skill-dirs /trusted/skills
+  --extensions-config /trusted/extensions.json
+  Host MCP execution remains disabled unless hostMcpEnabled=true in trusted config.
 `);
 }
 

@@ -7,18 +7,29 @@
     "allowedOrigins": [
       "https://chatgpt.com",
       "https://chat.openai.com"
-    ]
+    ],
+    "allowedHosts": [
+      "127.0.0.1",
+      "localhost",
+      "*.trycloudflare.com"
+    ],
+    "maxSessions": 100,
+    "sessionTtlMs": 1800000
   },
   "workspace": {
     "root": "/absolute/path/to/project",
     "containerPath": "/workspace",
     "defaultMountMode": "ro",
     "maxReadBytes": 1048576,
+    "maxHashBytes": 16777216,
+    "maxBatchReadBytes": 4194304,
+    "maxBatchReadItems": 20,
     "maxDirectoryEntries": 1000
   },
   "sandbox": {
     "containerName": "secure-mcp-sandbox",
     "image": "secure-mcp-sandbox:latest",
+    "startMode": "on-demand",
     "network": "none",
     "memory": "2g",
     "cpus": "2",
@@ -29,7 +40,11 @@
       "/tmp:rw,nosuid,nodev,size=512m"
     ],
     "timeoutMs": 30000,
-    "maxOutputBytes": 200000
+    "maxOutputBytes": 200000,
+    "taskPath": ".secure-mcp/sandbox-tasks",
+    "commandYieldMs": 8000,
+    "maxTaskLogBytes": 1048576,
+    "taskCancelGraceMs": 2000
   },
   "policy": {
     "allowExec": true,
@@ -42,6 +57,32 @@
     "enabled": true,
     "path": ".secure-mcp/audit.log"
   },
+  "extensions": {
+    "enabled": false,
+    "hostMcpEnabled": false,
+    "skillDirs": [],
+    "maxSkills": 100,
+    "maxSkillBytes": 131072,
+    "discoveryTtlMs": 300000,
+    "connectTimeoutMs": 10000,
+    "callTimeoutMs": 60000,
+    "maxResultBytes": 262144,
+    "maxToolsPerServer": 100,
+    "maxConcurrentMcpProcesses": 4,
+    "safeEnvKeys": [
+      "PATH",
+      "HOME",
+      "USER",
+      "USERNAME",
+      "LANG",
+      "LC_ALL",
+      "TERM",
+      "TMPDIR",
+      "TEMP",
+      "TMP"
+    ],
+    "mcpServers": []
+  },
   "codexHandoff": {
     "enabled": false,
     "queuePath": ".secure-mcp/codex-tasks",
@@ -50,6 +91,11 @@
     "maxTasksListed": 50,
     "taskTimeoutMs": 1800000,
     "workerPollIntervalMs": 5000,
+    "workerHeartbeatIntervalMs": 5000,
+    "workerHeartbeatTtlMs": 15000,
+    "cancellationPollIntervalMs": 1000,
+    "cancellationGraceMs": 2000,
+    "failOnContextDrift": true,
     "codexCommand": "codex",
     "codexArgs": [
       "exec",
@@ -59,6 +105,23 @@
       "never",
       "--json",
       "-"
+    ],
+    "allowedEnvKeys": [
+      "PATH",
+      "HOME",
+      "USER",
+      "USERNAME",
+      "LANG",
+      "LC_ALL",
+      "TERM",
+      "TMPDIR",
+      "TEMP",
+      "TMP",
+      "SHELL",
+      "CODEX_HOME"
+    ],
+    "allowedEnvPrefixes": [
+      "CODEX_"
     ]
   }
 }

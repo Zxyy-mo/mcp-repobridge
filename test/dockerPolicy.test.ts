@@ -9,11 +9,13 @@ import { testConfig } from "./helpers.js";
 describe("docker sandbox policy", () => {
   it("builds docker run args with fixed security defaults", () => {
     const config = testConfig("/workspace-host");
-    const args = buildDockerRunArgs(config);
+    const snapshotPath = "/tmp/mcp-repobridge-sandboxes/snapshot-test/workspace";
+    const args = buildDockerRunArgs(config, snapshotPath);
     const joined = args.join(" ");
 
     expect(args).toContain("--name");
     expect(args).toContain(config.sandbox.containerName);
+    expect(args).toContain("mcp-repobridge.managed=true");
     expect(args).toContain("--network");
     expect(args).toContain("none");
     expect(args).toContain("--cap-drop=ALL");
@@ -25,6 +27,8 @@ describe("docker sandbox policy", () => {
     expect(args).toContain(config.sandbox.cpus);
     expect(args).toContain("--pids-limit");
     expect(args).toContain(String(config.sandbox.pidsLimit));
+    expect(joined).toContain(`source=${snapshotPath}`);
+    expect(joined).not.toContain(`source=${config.workspace.root}`);
     expect(joined).not.toContain("/var/run/docker.sock");
     expect(joined).not.toContain(`${os.homedir()}:`);
     expect(joined).not.toContain(".ssh");

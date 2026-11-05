@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -62,6 +63,82 @@ describe("streamable HTTP MCP server", () => {
     expect(response.status).toBe(403);
   });
 
+  it("rejects bad Host before handling MCP", async () => {
+    running = await startServer();
+
+    const response = await postJsonWithHeaders(running.url, {
+      ...jsonHeaders(),
+      authorization: "Bearer test-token",
+      host: "evil.example"
+    }, initializeRequest());
+
+    expect(response.status).toBe(403);
+  });
+
+  it("rejects new sessions after reaching the configured session cap", async () => {
+    running = await startServer({ server: { maxSessions: 1 } });
+
+    const firstInit = await fetch(running.url, {
+      method: "POST",
+      headers: {
+        ...jsonHeaders(),
+        authorization: "Bearer test-token",
+        origin: "https://chatgpt.com"
+      },
+      body: JSON.stringify(initializeRequest())
+    });
+    expect(firstInit.status).toBe(200);
+
+    const secondInit = await fetch(running.url, {
+      method: "POST",
+      headers: {
+        ...jsonHeaders(),
+        authorization: "Bearer test-token",
+        origin: "https://chatgpt.com"
+      },
+      body: JSON.stringify(initializeRequest())
+    });
+
+    expect(secondInit.status).toBe(429);
+  });
+
+  it("expires idle MCP sessions", async () => {
+    running = await startServer({ server: { sessionTtlMs: 5 } });
+
+    const initResponse = await fetch(running.url, {
+      method: "POST",
+      headers: {
+        ...jsonHeaders(),
+        authorization: "Bearer test-token",
+        origin: "https://chatgpt.com"
+      },
+      body: JSON.stringify(initializeRequest())
+    });
+    expect(initResponse.status).toBe(200);
+    const sessionId = initResponse.headers.get("mcp-session-id");
+    expect(sessionId).toBeTruthy();
+
+    await sleep(20);
+
+    const listResponse = await fetch(running.url, {
+      method: "POST",
+      headers: {
+        ...jsonHeaders(),
+        authorization: "Bearer test-token",
+        origin: "https://chatgpt.com",
+        "mcp-session-id": sessionId ?? ""
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {}
+      })
+    });
+
+    expect(listResponse.status).toBe(404);
+  });
+
   it("lists only the secure v1 tool surface over HTTP", async () => {
     running = await startServer();
 
@@ -102,18 +179,21 @@ describe("streamable HTTP MCP server", () => {
   });
 });
 
-async function startServer(): Promise<RunningHttpMcpServer> {
+async function startServer(overrides: Parameters<typeof testConfig>[1] = {}): Promise<RunningHttpMcpServer> {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "secure-mcp-http-")));
   tempRoots.push(root);
   process.env[TOKEN_ENV] = "test-token";
   return startHttpMcpServer(testConfig(root, {
+    ...overrides,
     server: {
       transport: "streamable-http",
       port: 0,
       authTokenEnv: TOKEN_ENV,
-      allowedOrigins: ["https://chatgpt.com"]
+      allowedOrigins: ["https://chatgpt.com"],
+      allowedHosts: ["127.0.0.1"],
+      ...overrides.server
     },
-    audit: { enabled: false }
+    audit: { enabled: false, ...overrides.audit }
   }));
 }
 
@@ -151,4 +231,30 @@ async function readMcpResponse(response: Response): Promise<unknown> {
     throw new Error(`No SSE data line found: ${text}`);
   }
   return JSON.parse(dataLine.slice("data: ".length));
+}
+
+async function postJsonWithHeaders(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>
+): Promise<{ status: number }> {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      method: "POST",
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      headers
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve({ status: response.statusCode ?? 0 }));
+    });
+    request.on("error", reject);
+    request.end(JSON.stringify(body));
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

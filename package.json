@@ -1,11 +1,12 @@
 {
   "name": "mcp-repobridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:e2e": "RUN_E2E=1 vitest run test/e2e.docker.test.ts",
     "lint": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/index.js --config=examples/config.example.json",
     "bridge": "node scripts/secure_bridge.mjs",

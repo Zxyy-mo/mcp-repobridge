@@ -1,10 +1,11 @@
 import type { RuntimeConfig } from "../config/config.js";
 
-export function buildDockerRunArgs(config: RuntimeConfig): string[] {
+export function buildDockerRunArgs(config: RuntimeConfig, snapshotWorkspacePath: string): string[] {
   const args = [
     "run",
     "-d",
     "--name", config.sandbox.containerName,
+    "--label", "mcp-repobridge.managed=true",
     "--workdir", config.workspace.containerPath,
     "--user", config.sandbox.user,
     "--cap-drop=ALL",
@@ -25,7 +26,7 @@ export function buildDockerRunArgs(config: RuntimeConfig): string[] {
 
   args.push(
     "--mount",
-    `type=bind,source=${config.workspace.root},target=${config.workspace.containerPath},${config.workspace.defaultMountMode}`,
+    `type=bind,source=${snapshotWorkspacePath},target=${config.workspace.containerPath},rw`,
     config.sandbox.image,
     "sleep",
     "infinity"
